@@ -408,6 +408,59 @@ def extract_schema_metadata(conn, first_chunk_path, table_name):
     return columns_meta
 
 
+def analyze_table_overlaps(metadata):
+    table_columns = {}
+    normalized_columns = {}
+
+    for column in metadata.get("columns", []):
+        table_columns.setdefault(column["table"], []).append(column["name"])
+        normalized_columns.setdefault(column["table"], {})[normalize_identifier(column["name"])] = column["name"]
+
+    overlaps = []
+    table_names = sorted(table_columns.keys())
+    for index, left_table in enumerate(table_names):
+        for right_table in table_names[index + 1:]:
+            left_norm = normalized_columns.get(left_table, {})
+            right_norm = normalized_columns.get(right_table, {})
+            common_norms = sorted(set(left_norm.keys()).intersection(set(right_norm.keys())))
+            if not common_norms:
+                continue
+
+            shared_columns = []
+            shared_key_columns = []
+            for common_norm in common_norms:
+                left_col = left_norm[common_norm]
+                right_col = right_norm[common_norm]
+                shared_columns.append(
+                    {
+                        "normalized_name": common_norm,
+                        "left_column": left_col,
+                        "right_column": right_col,
+                    }
+                )
+                if common_norm == "id" or common_norm.endswith("id") or common_norm.endswith("key"):
+                    shared_key_columns.append(
+                        {
+                            "normalized_name": common_norm,
+                            "left_column": left_col,
+                            "right_column": right_col,
+                        }
+                    )
+
+            overlaps.append(
+                {
+                    "left_table": left_table,
+                    "right_table": right_table,
+                    "shared_column_count": len(shared_columns),
+                    "shared_key_count": len(shared_key_columns),
+                    "shared_columns": shared_columns,
+                    "shared_key_columns": shared_key_columns,
+                }
+            )
+
+    return overlaps
+
+
 def process_merge_strategy(conn, csv_paths, artifacts_dir, temp_dir, status):
     status.write("🔗 Strategy: Merge all CSV files into one logical table named `data`.")
     temp_master = os.path.join(temp_dir, "master.parquet")
@@ -607,6 +660,71 @@ def write_artifact_zip(artifacts_dir):
     return buffer.getvalue()
 
 
+def build_local_run_readme():
+    return """# Local Execution Package
+
+This package lets you run the same app locally, which is helpful when your sanitized or dummy dataset is too large for Streamlit Community Cloud browser uploads.
+
+## What is included
+
+- `streamlit_app.py`: the app code
+- `requirements.txt`: Python dependencies
+- `.streamlit/config.toml`: upload-size setting used by the app
+
+## Local setup steps
+
+1. Install Python 3.12 if you do not already have it.
+2. Open a terminal in this folder.
+3. Create and activate a virtual environment.
+4. Install dependencies:
+
+   `pip install -r requirements.txt`
+
+5. Run the app:
+
+   `streamlit run streamlit_app.py`
+
+6. Open the local URL shown in the terminal, usually `http://localhost:8501`.
+
+## API keys
+
+You can provide your key either in the app sidebar or via a local secrets file:
+
+Create `.streamlit/secrets.toml` with one or more of the following keys:
+
+```toml
+DEEPSEEK_API_KEY = "your-key-here"
+OPENAI_API_KEY = "your-key-here"
+XAI_API_KEY = "your-key-here"
+```
+
+## Recommended usage
+
+- Use `Keep files as separate tables` for multi-entity LMS exports such as users, enrollments, discussion posts, session history, and content objects.
+- Use `Merge all files into one table` only when all uploaded CSV files have the same shape and should become one combined dataset.
+- Local execution is the better path for larger files because it avoids Community Cloud browser-upload limits and tighter runtime ceilings.
+"""
+
+
+def write_local_execution_zip():
+    app_path = os.path.abspath(__file__)
+    repo_root = os.path.dirname(app_path)
+    requirements_path = os.path.join(repo_root, "requirements.txt")
+    config_path = os.path.join(repo_root, ".streamlit", "config.toml")
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        if os.path.exists(app_path):
+            zf.write(app_path, "streamlit_app.py")
+        if os.path.exists(requirements_path):
+            zf.write(requirements_path, "requirements.txt")
+        if os.path.exists(config_path):
+            zf.write(config_path, ".streamlit/config.toml")
+        zf.writestr("README_LOCAL.md", build_local_run_readme())
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 def process_uploaded_files(uploaded_files, strategy):
     if not uploaded_files:
         raise ValueError("Please upload at least one CSV or ZIP file.")
@@ -661,6 +779,7 @@ def process_uploaded_files(uploaded_files, strategy):
             "columns": result["columns"],
             "relationships": result["relationships"],
         }
+        metadata["table_overlaps"] = analyze_table_overlaps(metadata)
 
         metadata_path = os.path.join(artifacts_dir, "metadata.json")
         with open(metadata_path, "w", encoding="utf-8") as handle:
@@ -726,15 +845,46 @@ def get_stored_relationships(metadata):
     ]
 
 
+def get_overlap_relationship_hints(metadata):
+    hints = []
+    for item in metadata.get("table_overlaps", []):
+        if item.get("shared_key_count", 0) > 0:
+            key_labels = ", ".join(
+                f"{shared['left_column']} / {shared['right_column']}"
+                for shared in item.get("shared_key_columns", [])[:5]
+            )
+            hints.append(
+                f"- {item['left_table']} and {item['right_table']} share likely key columns: {key_labels}"
+            )
+        elif item.get("shared_column_count", 0) > 1:
+            col_labels = ", ".join(
+                f"{shared['left_column']} / {shared['right_column']}"
+                for shared in item.get("shared_columns", [])[:5]
+            )
+            hints.append(
+                f"- {item['left_table']} and {item['right_table']} share columns that may support comparisons: {col_labels}"
+            )
+    return hints
+
+
 def build_relationship_context(metadata):
     relationships = get_stored_relationships(metadata)
-    if not relationships:
-        return ""
-    return (
-        "\nKNOWN TABLE RELATIONSHIPS (prefer these JOIN paths when relevant):\n"
-        + "\n".join(relationships)
-        + "\n"
-    )
+    overlap_hints = get_overlap_relationship_hints(metadata)
+
+    blocks = []
+    if relationships:
+        blocks.append(
+            "\nKNOWN TABLE RELATIONSHIPS (prefer these JOIN paths when relevant):\n"
+            + "\n".join(relationships)
+            + "\n"
+        )
+    if overlap_hints:
+        blocks.append(
+            "\nTABLE OVERLAP HINTS (shared columns seen during preprocessing):\n"
+            + "\n".join(overlap_hints)
+            + "\n"
+        )
+    return "".join(blocks)
 
 
 def build_context_block(metadata, question):
@@ -790,6 +940,16 @@ def find_table_name_in_question(question, metadata):
                 best_score = len(candidate)
 
     return best_match
+
+
+def find_explicit_table_mentions(question, metadata):
+    question_norm = normalize_identifier(question)
+    matches = []
+    for table_name in metadata.get("tables", {}).keys():
+        candidates = candidate_entity_names(table_name) | {normalize_identifier(table_name)}
+        if any(candidate and candidate in question_norm for candidate in candidates):
+            matches.append(table_name)
+    return sorted(set(matches))
 
 
 def build_table_overview_rows(metadata):
@@ -910,10 +1070,45 @@ def handle_metadata_question(question, metadata):
             "answer": answer,
         }
 
+    if ("common" in q or "shared" in q or "overlap" in q) and ("columns" in q or "tables" in q):
+        rows = []
+        for item in metadata.get("table_overlaps", []):
+            rows.append(
+                {
+                    "left_table": item["left_table"],
+                    "right_table": item["right_table"],
+                    "shared_column_count": item["shared_column_count"],
+                    "shared_key_count": item["shared_key_count"],
+                    "shared_keys_preview": ", ".join(
+                        shared["left_column"] for shared in item.get("shared_key_columns", [])[:5]
+                    ),
+                }
+            )
+        df = pd.DataFrame(rows)
+        answer = (
+            "The table below shows which processed tables share columns or likely key fields. "
+            "Pairs with shared key columns are the best candidates for joins."
+        )
+        return {
+            "mode": "metadata",
+            "title": "Answered directly from processed metadata",
+            "dataframe": df,
+            "answer": answer,
+        }
+
     return None
 
 
-def get_sql_query(question, table_inventory, context_block, client, model_name, conversation_context, relationship_context):
+def get_sql_query(
+    question,
+    table_inventory,
+    context_block,
+    client,
+    model_name,
+    conversation_context,
+    relationship_context,
+    explicitly_named_tables="",
+):
     today = datetime.date.today().strftime("%Y-%m-%d")
     prompt = f"""You are an expert DuckDB SQL analyst specializing in education and LMS data.
 Current Date: {today}
@@ -923,6 +1118,7 @@ AVAILABLE TABLES & FILES:
 
 {context_block}
 {relationship_context}
+{explicitly_named_tables}
 {conversation_context}
 USER QUESTION:
 "{question}"
@@ -943,6 +1139,7 @@ SQL RULES:
 13. For questions like "how many enrollments are associated with users who ...", filter the enrollments table to the relevant users, then count enrollment rows from the enrollments table.
 14. When grouping activity by role or category, count the activity/event ID from the activity table, not the user ID unless the user asked for distinct users.
 15. If a join can multiply rows, use a subquery or COUNT(DISTINCT ...) when needed.
+16. If the user explicitly names tables, use all of those tables unless one is clearly irrelevant to the requested output.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -958,7 +1155,17 @@ SQL RULES:
     return _strip_markdown_sql(response.choices[0].message.content)
 
 
-def fix_sql_query(question, failed_sql, error_msg, table_inventory, context_block, client, model_name, relationship_context):
+def fix_sql_query(
+    question,
+    failed_sql,
+    error_msg,
+    table_inventory,
+    context_block,
+    client,
+    model_name,
+    relationship_context,
+    explicitly_named_tables="",
+):
     prompt = f"""The following DuckDB SQL query failed.
 
 FAILED SQL:
@@ -972,6 +1179,7 @@ AVAILABLE TABLES & FILES:
 
 {context_block}
 {relationship_context}
+{explicitly_named_tables}
 ORIGINAL QUESTION:
 "{question}"
 
@@ -1246,6 +1454,28 @@ def render_processing_ui():
             """
         )
 
+    with st.expander("Run this app locally for larger files", expanded=False):
+        st.markdown(
+            """
+            Local execution is the best option when your sanitized dataset is too large for Streamlit Community Cloud uploads or when you want more control over runtime resources.
+
+            Local quick start:
+            1. Download the local execution package below.
+            2. Unzip it on your machine.
+            3. Install Python 3.12.
+            4. Run `pip install -r requirements.txt`
+            5. Run `streamlit run streamlit_app.py`
+
+            You can provide your API key in the sidebar or by creating `.streamlit/secrets.toml` locally.
+            """
+        )
+        st.download_button(
+            "Download local execution package",
+            data=write_local_execution_zip(),
+            file_name="cloud_rag_data_assistant_local.zip",
+            mime="application/zip",
+        )
+
     strategy = st.radio(
         "Preprocessing strategy",
         options=["merge", "separate"],
@@ -1290,6 +1520,7 @@ def render_dataset_summary():
                 "processing_summary": summary,
                 "tables": metadata.get("tables", {}),
                 "relationships": metadata.get("relationships", []),
+                "table_overlaps": metadata.get("table_overlaps", []),
             }
         )
 
@@ -1365,6 +1596,14 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                     return
 
                 context_block = build_context_block(metadata, user_input)
+                explicit_tables = find_explicit_table_mentions(user_input, metadata)
+                explicit_table_block = ""
+                if explicit_tables:
+                    explicit_table_block = (
+                        "USER-REFERENCED TABLES:\n"
+                        + "\n".join(f"- {table_name}" for table_name in explicit_tables)
+                        + "\n"
+                    )
                 conversation_context = ""
                 msgs = st.session_state.messages
                 if len(msgs) >= 4 and msgs[-3]["role"] == "user" and msgs[-2]["role"] == "assistant":
@@ -1382,6 +1621,7 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                     model_name,
                     conversation_context,
                     relationship_context,
+                    explicit_table_block,
                 )
                 display_sql = sanitize_sql_for_display(sql, metadata, artifacts_dir)
                 st.code(display_sql, language="sql")
@@ -1403,6 +1643,7 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                         client,
                         model_name,
                         relationship_context,
+                        explicit_table_block,
                     )
                     retry_display_sql = sanitize_sql_for_display(sql_retry, metadata, artifacts_dir)
                     st.code(retry_display_sql, language="sql")
