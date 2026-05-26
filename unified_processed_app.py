@@ -1020,6 +1020,32 @@ def _strip_markdown_sql(text):
     return clean.strip()
 
 
+def strip_leading_sql_comments(sql_text):
+    if not sql_text:
+        return sql_text
+
+    cleaned = sql_text.lstrip()
+
+    while True:
+        if cleaned.startswith("--"):
+            newline_index = cleaned.find("\n")
+            if newline_index == -1:
+                return ""
+            cleaned = cleaned[newline_index + 1 :].lstrip()
+            continue
+
+        if cleaned.startswith("/*"):
+            end_index = cleaned.find("*/")
+            if end_index == -1:
+                return ""
+            cleaned = cleaned[end_index + 2 :].lstrip()
+            continue
+
+        break
+
+    return cleaned
+
+
 def find_table_name_in_question(question, metadata):
     question_norm = normalize_identifier(question)
     best_match = None
@@ -1315,7 +1341,7 @@ Fix the SQL. Use only read_parquet() for data access. Output only corrected SQL.
 
 
 def validate_sql(sql_query, artifacts_dir):
-    clean_sql = sql_query.strip().rstrip(";").strip()
+    clean_sql = strip_leading_sql_comments(sql_query).strip().rstrip(";").strip()
     if not clean_sql:
         raise ValueError("Security alert: empty SQL query.")
 
