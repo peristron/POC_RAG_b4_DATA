@@ -777,6 +777,142 @@ def _strip_markdown_sql(text):
     return clean.strip()
 
 
+def find_table_name_in_question(question, metadata):
+    question_norm = normalize_identifier(question)
+    best_match = None
+    best_score = 0
+
+    for table_name in metadata.get("tables", {}).keys():
+        candidates = candidate_entity_names(table_name) | {normalize_identifier(table_name)}
+        for candidate in candidates:
+            if candidate and candidate in question_norm and len(candidate) > best_score:
+                best_match = table_name
+                best_score = len(candidate)
+
+    return best_match
+
+
+def build_table_overview_rows(metadata):
+    rows = []
+    table_columns = {}
+    for column in metadata.get("columns", []):
+        table_columns.setdefault(column["table"], []).append(column["name"])
+
+    for table_name, table_info in metadata.get("tables", {}).items():
+        rows.append(
+            {
+                "table_name": table_name,
+                "row_count": table_info.get("total_rows"),
+                "column_count": len(table_columns.get(table_name, [])),
+                "appears_to_represent": infer_table_description(table_name, table_columns.get(table_name, [])),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def infer_table_description(table_name, column_names):
+    name = table_name.lower()
+    column_set = {col.lower() for col in column_names}
+
+    if "discussion" in name:
+        return "Forum or discussion activity such as posts, replies, threads, or engagement details."
+    if "enrollment" in name:
+        return "User enrollments, roles, and organization or course membership records."
+    if "session" in name or "history" in name:
+        return "Login sessions or usage-history events with timestamps and access activity."
+    if "user" in name:
+        return "User account, profile, status, and time-based account activity fields."
+    if "content" in name:
+        return "Learning content objects with type, status, dates, or hierarchy metadata."
+    if "userid" in column_set and "rolename" in column_set:
+        return "Records keyed by user with role or participation metadata."
+    return "A processed table from the uploaded dataset."
+
+
+def build_columns_dataframe(metadata, table_name):
+    rows = []
+    for column in metadata.get("columns", []):
+        if column["table"] != table_name:
+            continue
+        samples = column["description"].split("Samples: ", 1)[-1]
+        rows.append(
+            {
+                "column_name": column["name"],
+                "data_type": column["type"],
+                "sample_values": samples,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def handle_metadata_question(question, metadata):
+    q = question.lower()
+    table_name = find_table_name_in_question(question, metadata)
+
+    if (("what tables" in q or "which tables" in q) and ("represent" in q or "included" in q)) or (
+        "what tables are included" in q
+    ):
+        df = build_table_overview_rows(metadata)
+        lines = ["Here are the processed tables and what they appear to represent:"]
+        for _, row in df.iterrows():
+            lines.append(
+                f"- `{row['table_name']}`: about {row['row_count']:,} rows, {row['column_count']} columns, and appears to represent {row['appears_to_represent'].lower()}"
+            )
+        return {
+            "mode": "metadata",
+            "title": "Answered directly from processed metadata",
+            "dataframe": df,
+            "answer": "\n".join(lines),
+        }
+
+    if "how many total rows" in q and "each table" in q:
+        rows = []
+        for table, info in metadata.get("tables", {}).items():
+            rows.append({"table_name": table, "row_count": info.get("total_rows", 0)})
+        df = pd.DataFrame(rows).sort_values("table_name").reset_index(drop=True)
+        lines = ["Row counts by table:"]
+        for _, row in df.iterrows():
+            lines.append(f"- `{row['table_name']}`: {row['row_count']:,} rows")
+        return {
+            "mode": "metadata",
+            "title": "Answered directly from processed metadata",
+            "dataframe": df,
+            "answer": "\n".join(lines),
+        }
+
+    if table_name and ("which columns" in q or "what columns" in q or "available in" in q):
+        df = build_columns_dataframe(metadata, table_name)
+        if df.empty:
+            return None
+        answer = (
+            f"The `{table_name}` table has {len(df)} columns. "
+            f"The table below lists each column, its type, and sample values captured during preprocessing."
+        )
+        return {
+            "mode": "metadata",
+            "title": f"Answered directly from metadata for `{table_name}`",
+            "dataframe": df,
+            "answer": answer,
+        }
+
+    if "relationships" in q and ("detected" in q or "found" in q or "between tables" in q):
+        rows = metadata.get("relationships", [])
+        if rows:
+            df = pd.DataFrame(rows)
+            answer = "These are the table relationships detected during preprocessing."
+        else:
+            df = pd.DataFrame(columns=["from_table", "from_column", "to_table", "to_column"])
+            answer = "No explicit table relationships were detected during preprocessing."
+        return {
+            "mode": "metadata",
+            "title": "Answered directly from processed metadata",
+            "dataframe": df,
+            "answer": answer,
+        }
+
+    return None
+
+
 def get_sql_query(question, table_inventory, context_block, client, model_name, conversation_context, relationship_context):
     today = datetime.date.today().strftime("%Y-%m-%d")
     prompt = f"""You are an expert DuckDB SQL analyst specializing in education and LMS data.
@@ -1113,6 +1249,7 @@ def render_processing_ui():
     strategy = st.radio(
         "Preprocessing strategy",
         options=["merge", "separate"],
+        index=1,
         format_func=lambda value: "Merge all files into one table" if value == "merge" else "Keep files as separate tables",
         horizontal=True,
     )
@@ -1210,6 +1347,23 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
     with st.chat_message("assistant"):
         with st.status("Thinking...", expanded=False) as status:
             try:
+                direct_response = handle_metadata_question(user_input, metadata)
+                if direct_response is not None:
+                    status.write(direct_response["title"])
+                    df = direct_response["dataframe"]
+                    if not df.empty:
+                        st.dataframe(df, use_container_width=True)
+                        st.download_button(
+                            "Download results as CSV",
+                            data=df.to_csv(index=False),
+                            file_name="metadata_results.csv",
+                            mime="text/csv",
+                        )
+                    status.update(label="✅ Answer ready", state="complete")
+                    st.write(direct_response["answer"])
+                    st.session_state.messages.append({"role": "assistant", "content": direct_response["answer"]})
+                    return
+
                 context_block = build_context_block(metadata, user_input)
                 conversation_context = ""
                 msgs = st.session_state.messages
