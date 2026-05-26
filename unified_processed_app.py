@@ -461,6 +461,20 @@ def analyze_table_overlaps(metadata):
     return overlaps
 
 
+def inspect_csv_headers(csv_paths):
+    header_map = {}
+    signature_map = {}
+    for csv_path in csv_paths:
+        try:
+            header_df = pd.read_csv(csv_path, nrows=0, encoding_errors="replace")
+            clean_headers = tuple(clean_column_names(header_df.columns))
+        except Exception:
+            clean_headers = tuple()
+        header_map[os.path.basename(csv_path)] = clean_headers
+        signature_map.setdefault(clean_headers, []).append(os.path.basename(csv_path))
+    return header_map, signature_map
+
+
 def process_merge_strategy(conn, csv_paths, artifacts_dir, temp_dir, status):
     status.write("🔗 Strategy: Merge all CSV files into one logical table named `data`.")
     temp_master = os.path.join(temp_dir, "master.parquet")
@@ -670,21 +684,49 @@ This package lets you run the same app locally, which is helpful when your sanit
 - `streamlit_app.py`: the app code
 - `requirements.txt`: Python dependencies
 - `.streamlit/config.toml`: upload-size setting used by the app
+- `.streamlit/secrets.toml.example`: example secrets file
+- `run_local_app.bat`: Windows launcher
+- `run_local_app.sh`: Mac/Linux launcher
 
 ## Local setup steps
 
 1. Install Python 3.12 if you do not already have it.
 2. Open a terminal in this folder.
-3. Create and activate a virtual environment.
+3. Create and activate a virtual environment:
+
+   Windows:
+
+   `python -m venv .venv`
+
+   `.venv\\Scripts\\activate`
+
+   Mac/Linux:
+
+   `python3 -m venv .venv`
+
+   `source .venv/bin/activate`
+
 4. Install dependencies:
 
    `pip install -r requirements.txt`
 
-5. Run the app:
+5. Add your API key either in the app sidebar or by copying `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and filling in one or more keys.
+
+6. Run the app:
 
    `streamlit run streamlit_app.py`
 
-6. Open the local URL shown in the terminal, usually `http://localhost:8501`.
+   Or use the included launcher script:
+
+   Windows:
+
+   `run_local_app.bat`
+
+   Mac/Linux:
+
+   `bash run_local_app.sh`
+
+7. Open the local URL shown in the terminal, usually `http://localhost:8501`.
 
 ## API keys
 
@@ -703,6 +745,44 @@ XAI_API_KEY = "your-key-here"
 - Use `Keep files as separate tables` for multi-entity LMS exports such as users, enrollments, discussion posts, session history, and content objects.
 - Use `Merge all files into one table` only when all uploaded CSV files have the same shape and should become one combined dataset.
 - Local execution is the better path for larger files because it avoids Community Cloud browser-upload limits and tighter runtime ceilings.
+- If the app warns that your uploaded files have mismatched columns, switch to `Keep files as separate tables`.
+"""
+
+
+def build_local_secrets_example():
+    return """DEEPSEEK_API_KEY = "your-key-here"
+OPENAI_API_KEY = "your-key-here"
+XAI_API_KEY = "your-key-here"
+"""
+
+
+def build_windows_launcher():
+    return """@echo off
+setlocal
+
+if not exist .venv (
+  python -m venv .venv
+)
+
+call .venv\\Scripts\\activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+streamlit run streamlit_app.py
+"""
+
+
+def build_unix_launcher():
+    return """#!/usr/bin/env bash
+set -e
+
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
+fi
+
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+streamlit run streamlit_app.py
 """
 
 
@@ -721,6 +801,9 @@ def write_local_execution_zip():
         if os.path.exists(config_path):
             zf.write(config_path, ".streamlit/config.toml")
         zf.writestr("README_LOCAL.md", build_local_run_readme())
+        zf.writestr(".streamlit/secrets.toml.example", build_local_secrets_example())
+        zf.writestr("run_local_app.bat", build_windows_launcher())
+        zf.writestr("run_local_app.sh", build_unix_launcher())
     buffer.seek(0)
     return buffer.getvalue()
 
@@ -764,6 +847,16 @@ def process_uploaded_files(uploaded_files, strategy):
             raise ValueError("No CSV files were found after upload and extraction.")
 
         status.write(f"📊 Found {len(csv_paths)} CSV file(s). Converting them to chunked Parquet artifacts.")
+        header_map, signature_map = inspect_csv_headers(csv_paths)
+        if strategy == "merge" and len(signature_map) > 1:
+            preview_groups = []
+            for signature_files in list(signature_map.values())[:3]:
+                preview_groups.append(", ".join(signature_files[:3]))
+            raise ValueError(
+                "Merge mode is not recommended for this upload because the CSV files do not share the same column structure. "
+                "Please switch to 'Keep files as separate tables'. "
+                f"Detected multiple header patterns across files such as: {' | '.join(preview_groups)}"
+            )
         conn = duckdb.connect()
 
         if strategy == "merge":
@@ -1008,10 +1101,33 @@ def build_columns_dataframe(metadata, table_name):
 def handle_metadata_question(question, metadata):
     q = question.lower()
     table_name = find_table_name_in_question(question, metadata)
+    explicit_tables = find_explicit_table_mentions(question, metadata)
+    analysis_markers = [
+        " then ",
+        " before ",
+        " using ",
+        " together",
+        " summary",
+        " diagnostic",
+        " percentage",
+        " percent",
+        " average",
+        " order ",
+        " exclude ",
+        " compare",
+        " group by",
+        " one row per",
+        " posted",
+        " include",
+        " join",
+        " metric",
+        " metrics",
+    ]
+    has_analysis_signal = any(marker in f" {q} " for marker in analysis_markers)
 
-    if (("what tables" in q or "which tables" in q) and ("represent" in q or "included" in q)) or (
+    if not has_analysis_signal and ((("what tables" in q or "which tables" in q) and ("represent" in q or "included" in q)) or (
         "what tables are included" in q
-    ):
+    )):
         df = build_table_overview_rows(metadata)
         lines = ["Here are the processed tables and what they appear to represent:"]
         for _, row in df.iterrows():
@@ -1025,7 +1141,7 @@ def handle_metadata_question(question, metadata):
             "answer": "\n".join(lines),
         }
 
-    if "how many total rows" in q and "each table" in q:
+    if not has_analysis_signal and "how many total rows" in q and "each table" in q:
         rows = []
         for table, info in metadata.get("tables", {}).items():
             rows.append({"table_name": table, "row_count": info.get("total_rows", 0)})
@@ -1040,7 +1156,9 @@ def handle_metadata_question(question, metadata):
             "answer": "\n".join(lines),
         }
 
-    if table_name and ("which columns" in q or "what columns" in q or "available in" in q):
+    if not has_analysis_signal and table_name and len(explicit_tables) <= 1 and (
+        "which columns" in q or "what columns" in q or "available in" in q
+    ):
         df = build_columns_dataframe(metadata, table_name)
         if df.empty:
             return None
@@ -1055,7 +1173,7 @@ def handle_metadata_question(question, metadata):
             "answer": answer,
         }
 
-    if "relationships" in q and ("detected" in q or "found" in q or "between tables" in q):
+    if not has_analysis_signal and "relationships" in q and ("detected" in q or "found" in q or "between tables" in q):
         rows = metadata.get("relationships", [])
         if rows:
             df = pd.DataFrame(rows)
@@ -1070,7 +1188,7 @@ def handle_metadata_question(question, metadata):
             "answer": answer,
         }
 
-    if ("common" in q or "shared" in q or "overlap" in q) and ("columns" in q or "tables" in q):
+    if not has_analysis_signal and ("common" in q or "shared" in q or "overlap" in q) and ("columns" in q or "tables" in q):
         rows = []
         for item in metadata.get("table_overlaps", []):
             rows.append(
@@ -1466,7 +1584,16 @@ def render_processing_ui():
             4. Run `pip install -r requirements.txt`
             5. Run `streamlit run streamlit_app.py`
 
+            Included in the download:
+            - the app code
+            - `requirements.txt`
+            - `.streamlit/config.toml`
+            - `.streamlit/secrets.toml.example`
+            - Windows and Mac/Linux launcher scripts
+            - a local README
+
             You can provide your API key in the sidebar or by creating `.streamlit/secrets.toml` locally.
+            Multi-table LMS exports should usually use `Keep files as separate tables`.
             """
         )
         st.download_button(
