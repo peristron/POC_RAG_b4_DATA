@@ -37,8 +37,14 @@ UPLOAD_WARNING_MB = 400
 HARD_ROW_LIMIT = 1000
 MAX_ROWS_FOR_SUMMARY = 50
 FULL_SCHEMA_THRESHOLD = 180
+DEFAULT_PROVIDER_NAME = "DeepSeek"
 
 PROVIDER_CONFIG = {
+    "DeepSeek": {
+        "base_url": "https://api.deepseek.com",
+        "default_model": "deepseek-chat",
+        "secret_key": "DEEPSEEK_API_KEY",
+    },
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
         "default_model": "gpt-4o-mini",
@@ -48,11 +54,6 @@ PROVIDER_CONFIG = {
         "base_url": "https://api.x.ai/v1",
         "default_model": "grok-2-latest",
         "secret_key": "XAI_API_KEY",
-    },
-    "DeepSeek": {
-        "base_url": "https://api.deepseek.com",
-        "default_model": "deepseek-chat",
-        "secret_key": "DEEPSEEK_API_KEY",
     },
 }
 
@@ -224,6 +225,36 @@ def tokenize(text):
     return set(re.findall(r"[a-z0-9]+", (text or "").lower()))
 
 
+def normalize_identifier(value):
+    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+
+
+def singularize_name(value):
+    clean = normalize_identifier(value)
+    if clean.endswith("ies") and len(clean) > 3:
+        return clean[:-3] + "y"
+    if clean.endswith("ses") and len(clean) > 3:
+        return clean[:-2]
+    if clean.endswith("s") and not clean.endswith("ss") and len(clean) > 1:
+        return clean[:-1]
+    return clean
+
+
+def candidate_entity_names(table_name):
+    normalized = normalize_identifier(table_name)
+    singular = singularize_name(table_name)
+    names = {normalized, singular}
+    if singular.endswith("history"):
+        names.add(singular.replace("history", ""))
+    if singular.endswith("enrollment"):
+        names.add("user")
+    return {name for name in names if name}
+
+
+def escape_sql_literal(value):
+    return value.replace("'", "''")
+
+
 def detect_pii_columns(df):
     pii_cols = []
     for col in df.columns:
@@ -278,54 +309,65 @@ def split_parquet_to_chunks(source_parquet, table_name, rows_per_chunk, output_d
 
 def detect_relationships(conn, tables_metadata, artifacts_dir, status):
     table_columns = {}
+    normalized_columns = {}
     relationships = []
     seen = set()
 
     for table_name in tables_metadata:
         first_chunk = os.path.join(artifacts_dir, f"{table_name}_0.parquet").replace("\\", "/")
         schema_df = conn.execute(f"DESCRIBE SELECT * FROM read_parquet('{first_chunk}')").df()
-        table_columns[table_name] = set(schema_df["column_name"].tolist())
+        columns = schema_df["column_name"].tolist()
+        table_columns[table_name] = columns
+        normalized_columns[table_name] = {normalize_identifier(col): col for col in columns}
 
     table_names = list(table_columns.keys())
-    for i, left_table in enumerate(table_names):
+    for left_table in table_names:
         for right_table in table_names:
             if left_table == right_table:
                 continue
 
-            for candidate in table_columns[right_table]:
-                normalized = candidate.lower()
-                if not normalized.endswith("_id"):
+            left_entities = candidate_entity_names(left_table)
+            left_norm_map = normalized_columns[left_table]
+            right_norm_map = normalized_columns[right_table]
+
+            for right_norm, right_col in right_norm_map.items():
+                if not right_norm.endswith("id"):
                     continue
 
-                base_name = normalized[:-3]
-                if base_name == left_table or base_name == left_table.rstrip("s"):
-                    for pk_col in [candidate, "id", f"{left_table}_id"]:
-                        if pk_col in table_columns[left_table]:
-                            rel_key = (right_table, candidate, left_table, pk_col)
+                base_name = right_norm[:-2]
+                pk_candidates = ["id"] + [f"{entity}id" for entity in left_entities]
+                if base_name in left_entities:
+                    for pk_norm in pk_candidates:
+                        if pk_norm in left_norm_map:
+                            pk_col = left_norm_map[pk_norm]
+                            rel_key = (right_table, right_col, left_table, pk_col)
                             if rel_key not in seen:
                                 seen.add(rel_key)
                                 relationships.append(
                                     {
                                         "from_table": right_table,
-                                        "from_column": candidate,
+                                        "from_column": right_col,
                                         "to_table": left_table,
                                         "to_column": pk_col,
                                     }
                                 )
+                            break
 
-            common_cols = table_columns[left_table].intersection(table_columns[right_table])
-            for common_col in common_cols:
-                if common_col.lower() == "id":
+            common_norms = set(left_norm_map.keys()).intersection(set(right_norm_map.keys()))
+            for common_norm in common_norms:
+                if common_norm == "id" or not common_norm.endswith("id"):
                     continue
-                rel_key = tuple(sorted([left_table, right_table]) + [common_col])
-                if rel_key not in seen and common_col.lower().endswith("_id"):
+                common_col_left = left_norm_map[common_norm]
+                common_col_right = right_norm_map[common_norm]
+                rel_key = tuple(sorted([left_table, right_table]) + [common_norm])
+                if rel_key not in seen:
                     seen.add(rel_key)
                     relationships.append(
                         {
                             "from_table": left_table,
-                            "from_column": common_col,
+                            "from_column": common_col_left,
                             "to_table": right_table,
-                            "to_column": common_col,
+                            "to_column": common_col_right,
                         }
                     )
 
@@ -664,6 +706,18 @@ def build_table_inventory(metadata, artifacts_dir):
     return "\n".join(lines)
 
 
+def sanitize_sql_for_display(sql_text, metadata, artifacts_dir):
+    if not sql_text:
+        return sql_text
+
+    clean_sql = sql_text
+    for table_name, table_info in metadata.get("tables", {}).items():
+        pattern = os.path.join(artifacts_dir, table_info["file_pattern"]).replace("\\", "/")
+        replacement = f"ARTIFACT::{table_name}"
+        clean_sql = clean_sql.replace(pattern, replacement)
+    return clean_sql
+
+
 def get_stored_relationships(metadata):
     stored = metadata.get("relationships", [])
     return [
@@ -748,6 +802,11 @@ SQL RULES:
 8. Use date_trunc for month or quarter grouping.
 9. Exclude nulls where appropriate.
 10. When joining tables, prefer the known relationships supplied above.
+11. First identify the grain of the answer before counting. Count rows or distinct IDs at that grain to avoid accidental duplication from joins.
+12. For questions like "how many users", "how many authors", or "how many students", prefer COUNT(DISTINCT user-like ID).
+13. For questions like "how many enrollments are associated with users who ...", filter the enrollments table to the relevant users, then count enrollment rows from the enrollments table.
+14. When grouping activity by role or category, count the activity/event ID from the activity table, not the user ID unless the user asked for distinct users.
+15. If a join can multiply rows, use a subquery or COUNT(DISTINCT ...) when needed.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -888,6 +947,9 @@ def attempt_visualization(df):
         if df.empty:
             return
 
+        if len(df) < 2:
+            return
+
         numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
         date_cols = df.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
         categorical_cols = df.select_dtypes(include=["object", "string", "category"]).columns.tolist()
@@ -901,6 +963,9 @@ def attempt_visualization(df):
                     date_cols.append(col_name)
                     categorical_cols.remove(col_name)
                     break
+
+        if len(df.columns) <= 2 and len(df) <= 5 and len(numeric_cols) >= 1:
+            return
 
         st.caption("Auto-visualization")
         if date_cols and numeric_cols:
@@ -965,7 +1030,12 @@ def render_sidebar():
     with st.sidebar:
         st.title("Configuration")
 
-        provider_name = st.selectbox("LLM provider", list(PROVIDER_CONFIG.keys()))
+        provider_names = list(PROVIDER_CONFIG.keys())
+        provider_name = st.selectbox(
+            "LLM provider",
+            provider_names,
+            index=provider_names.index(DEFAULT_PROVIDER_NAME),
+        )
         provider_config = PROVIDER_CONFIG[provider_name]
 
         api_key = ""
@@ -1011,6 +1081,34 @@ def render_processing_ui():
     st.caption(
         "This cloud version assumes the source data is already sanitized or dummy data. It processes uploads into chunked local Parquet files inside the running Streamlit session."
     )
+
+    with st.expander("How to use this app", expanded=False):
+        st.markdown(
+            """
+            1. Choose your LLM provider in the sidebar.
+            2. Upload sanitized or dummy CSV files. You can also upload ZIP files that contain CSVs.
+            3. Pick a preprocessing strategy:
+               - `Merge all files into one table` for same-shape files that should become one dataset.
+               - `Keep files as separate tables` for related LMS exports such as users, enrollments, discussion posts, and content objects.
+            4. Click `Process uploads` and wait for the dataset summary to appear.
+            5. Review the processed table list and then ask a specific question in plain English.
+            6. Start with counts, comparisons, and date trends before moving into more complex joins.
+
+            Example questions:
+            - How many users have posted discussion posts?
+            - How many discussion post authors are also in the users table?
+            - Show discussion post counts by user role.
+            - How many enrollments are associated with users who have posted discussions?
+            - Which content object types are included in the dataset?
+            - Are there any content objects marked as deleted?
+            - Show the count of logins or events by month.
+
+            Tips:
+            - Short, specific questions work best.
+            - For grouped answers, name the grouping field you care about, such as role, course, month, or completion status.
+            - This app is intended for exploratory analysis of sanitized data, not for raw confidential data.
+            """
+        )
 
     strategy = st.radio(
         "Preprocessing strategy",
@@ -1131,7 +1229,8 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                     conversation_context,
                     relationship_context,
                 )
-                st.code(sql, language="sql")
+                display_sql = sanitize_sql_for_display(sql, metadata, artifacts_dir)
+                st.code(display_sql, language="sql")
 
                 clean_sql = validate_sql(sql, artifacts_dir)
                 status.write("Executing query")
@@ -1151,7 +1250,8 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                         model_name,
                         relationship_context,
                     )
-                    st.code(sql_retry, language="sql")
+                    retry_display_sql = sanitize_sql_for_display(sql_retry, metadata, artifacts_dir)
+                    st.code(retry_display_sql, language="sql")
                     clean_sql = validate_sql(sql_retry, artifacts_dir)
                     df = execute_validated_sql(clean_sql, artifacts_dir)
 
