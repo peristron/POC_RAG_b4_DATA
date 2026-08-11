@@ -823,7 +823,11 @@ def process_uploaded_files(uploaded_files, strategy):
 
     try:
         total_uploaded_mb = 0.0
-        for uploaded_file in uploaded_files:
+        progress_bar = st.progress(0)
+        total = len(uploaded_files)
+        for i, uploaded_file in enumerate(uploaded_files):
+            status.write(f"📥 Processing file {i + 1} of {total}: {uploaded_file.name}")
+            progress_bar.progress((i + 1) / total)
             file_path = os.path.join(upload_dir, uploaded_file.name)
             file_bytes = uploaded_file.getbuffer()
             total_uploaded_mb += len(file_bytes) / (1024 * 1024)
@@ -1842,7 +1846,13 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                 st.error(str(exc))
 
 
+@st.fragment(run_every=55)
+def _keepalive():
+    st.empty()
+
+
 def main():
+    _keepalive()
     ensure_session_state()
 
     st.title(APP_TITLE)
