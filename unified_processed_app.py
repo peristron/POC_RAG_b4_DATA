@@ -29,7 +29,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-APP_TITLE = "Cloud RAG Data Assistant"
+APP_TITLE = "Cloud RAG Data Assistant - vD4"
 APP_SUBTITLE = "Unified pre + post process for sanitized or dummy CSV data"
 SESSION_ROOT = os.path.join(tempfile.gettempdir(), "streamlit_cloud_rag")
 CHUNK_SIZE_MB = 64
