@@ -1,5 +1,7 @@
 import datetime
+import copy
 import gc
+import hashlib
 import io
 import json
 import logging
@@ -29,7 +31,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-APP_TITLE = "Cloud RAG Data Assistant - vD4"
+APP_TITLE = "Cloud RAG Data Assistant - vD5"
 APP_SUBTITLE = "Unified pre + post process for sanitized or dummy CSV data"
 SESSION_ROOT = os.path.join(tempfile.gettempdir(), "streamlit_cloud_rag")
 CHUNK_SIZE_MB = 64
@@ -38,6 +40,57 @@ HARD_ROW_LIMIT = 1000
 MAX_ROWS_FOR_SUMMARY = 50
 FULL_SCHEMA_THRESHOLD = 180
 DEFAULT_PROVIDER_NAME = "DeepSeek"
+DOCUMENTATION_METADATA_FILENAME = "dataset_metadata.csv"
+
+BUILTIN_BRIGHTSPACE_DOCUMENTATION = {
+    "systemaccesslog": {
+        "dataset_name": "System Access Log",
+        "dataset_description": (
+            "Captures each time a user starts or ends access to Brightspace from a browser, "
+            "the Pulse app, or the Brightspace Parent & Guardian mobile app."
+        ),
+        "url": "https://community.d2l.com/brightspace/kb/articles/4537-sessions-and-system-access-data-sets",
+        "columns": {
+            "SessionId": {"description": "Unique identifier for the system access session.", "key": "PK"},
+            "UserId": {"description": "Unique identifier for the user.", "key": "PK, FK"},
+            "Timestamp": {"description": "UTC date and time when system access changed state.", "key": "PK"},
+            "State": {
+                "description": "Indicates whether system access started or ended at the reported time.",
+                "values": "Start; End",
+                "key": "PK",
+            },
+            "Source": {
+                "description": "Source of access.",
+                "values": "Brightspace; Pulse; BPG-mobile",
+            },
+            "AppVersion": {"description": "Application version, when applicable."},
+            "Device": {"description": "Device used for the system access, when reported."},
+            "IsOfflineMode": {"description": "Whether some or all access occurred without an internet connection."},
+            "IPAddress": {"description": "IP address associated with the event; may contain sensitive data."},
+        },
+    },
+    "organizationalunits": {
+        "dataset_name": "Organizational Units",
+        "dataset_description": "Returns details about all organizational units in the Brightspace organization.",
+        "url": "https://community.d2l.com/brightspace/kb/articles/4529-organizational-units-data-sets",
+        "columns": {
+            "OrgUnitId": {"description": "Unique organizational unit identifier.", "key": "PK"},
+            "Organization": {"description": "Organization name."},
+            "Type": {"description": "Organizational unit type, such as Group, Section, Semester, or Department."},
+            "Name": {"description": "Organizational unit name."},
+            "Code": {"description": "Organizational unit code."},
+            "StartDate": {"description": "Availability start date in UTC."},
+            "EndDate": {"description": "Availability end date in UTC."},
+            "IsActive": {"description": "Whether the organizational unit is active."},
+            "CreatedDate": {"description": "Organizational unit creation date."},
+            "IsDeleted": {"description": "Whether the organizational unit is soft deleted or recycled."},
+            "DeletedDate": {"description": "Date the organizational unit was soft deleted."},
+            "RecycledDate": {"description": "Date the organizational unit was recycled."},
+            "Version": {"description": "Version of the content in the row."},
+            "OrgUnitTypeId": {"description": "Identifier for the organizational unit type."},
+        },
+    },
+}
 
 PROVIDER_CONFIG = {
     "DeepSeek": {
@@ -116,6 +169,7 @@ PII_COLUMN_PATTERNS = [
     r"(?i)\bguardian\b",
     r"(?i)\bcontact\b",
     r"(?i)\bpersonal\b",
+    r"(?i)\bip.?address\b",
 ]
 
 
@@ -159,6 +213,12 @@ def ensure_session_state():
         st.session_state.pii_redaction = True
     if "processing_summary" not in st.session_state:
         st.session_state.processing_summary = {}
+    if "documentation_snapshot_bytes" not in st.session_state:
+        st.session_state.documentation_snapshot_bytes = b""
+    if "documentation_snapshot_name" not in st.session_state:
+        st.session_state.documentation_snapshot_name = ""
+    if "documentation_snapshot_digest" not in st.session_state:
+        st.session_state.documentation_snapshot_digest = ""
 
 
 def build_session_paths():
@@ -273,6 +333,272 @@ def redact_pii(df):
     for col in pii_cols:
         redacted_df[col] = "[REDACTED]"
     return redacted_df, pii_cols
+
+
+def normalize_documentation_name(value):
+    text = os.path.splitext(str(value or ""))[0].lower()
+    text = re.sub(r"_part_\d+$", "", text)
+    text = re.sub(
+        r"(?:^|[_\-\s])(anonymized|anonymised|sanitized|sanitised|dummy)(?=$|[_\-\s])",
+        "_",
+        text,
+    )
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def get_documentation_snapshot_path():
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), DOCUMENTATION_METADATA_FILENAME),
+        os.path.join(os.getcwd(), DOCUMENTATION_METADATA_FILENAME),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 100:
+            return candidate
+    return ""
+
+
+def parse_documentation_snapshot(snapshot_bytes):
+    """Validate and parse a Dataset Explorer metadata CSV."""
+    snapshot = pd.read_csv(io.BytesIO(snapshot_bytes), encoding="utf-8").fillna("")
+    required = {"dataset_name", "column_name"}
+    missing = sorted(required - set(snapshot.columns))
+    if missing:
+        raise ValueError(
+            "Documentation metadata CSV is missing required column(s): " + ", ".join(missing)
+        )
+    if snapshot.empty:
+        raise ValueError("Documentation metadata CSV contains no rows.")
+    return snapshot
+
+
+def merge_documentation_snapshot(catalog, snapshot):
+    """Merge a validated Dataset Explorer snapshot into the documentation catalog."""
+    for dataset_name, rows in snapshot.groupby("dataset_name", sort=False):
+        normalized_name = normalize_documentation_name(dataset_name)
+        if not normalized_name:
+            continue
+        first = rows.iloc[0]
+        entry = copy.deepcopy(catalog.get(normalized_name, {"columns": {}}))
+        entry["dataset_name"] = str(dataset_name)
+        scraped_description = str(first.get("dataset_description", "")).strip()
+        scraped_url = str(first.get("url", "")).strip()
+        if scraped_description:
+            entry["dataset_description"] = scraped_description
+        if scraped_url:
+            entry["url"] = scraped_url
+        entry.setdefault("columns", {})
+        for _, row in rows.iterrows():
+            column_name = str(row.get("column_name", "")).strip()
+            if not column_name:
+                continue
+            scraped_column = {
+                "description": str(row.get("description", "")).strip(),
+                "data_type": str(row.get("data_type", "")).strip(),
+                "key": str(row.get("key", "")).strip(),
+                "is_nullable": str(row.get("is_nullable", "")).strip(),
+                "version_history": str(row.get("version_history", "")).strip(),
+            }
+            merged_column = copy.deepcopy(entry["columns"].get(column_name, {}))
+            merged_column.update({key: value for key, value in scraped_column.items() if value})
+            entry["columns"][column_name] = merged_column
+        catalog[normalized_name] = entry
+    return catalog
+
+
+def load_documentation_catalog():
+    """Load the optional public documentation snapshot plus verified demo fallbacks."""
+    catalog = copy.deepcopy(BUILTIN_BRIGHTSPACE_DOCUMENTATION)
+    uploaded_bytes = st.session_state.get("documentation_snapshot_bytes", b"")
+    uploaded_name = st.session_state.get("documentation_snapshot_name", "")
+    if uploaded_bytes:
+        try:
+            snapshot = parse_documentation_snapshot(uploaded_bytes)
+            return merge_documentation_snapshot(catalog, snapshot), uploaded_name or "uploaded metadata CSV"
+        except Exception as exc:
+            logging.warning("Could not load uploaded documentation snapshot: %s", exc)
+
+    snapshot_path = get_documentation_snapshot_path()
+    if not snapshot_path:
+        return catalog, "built-in verified subset"
+
+    try:
+        with open(snapshot_path, "rb") as handle:
+            snapshot = parse_documentation_snapshot(handle.read())
+        return merge_documentation_snapshot(catalog, snapshot), os.path.basename(snapshot_path)
+    except Exception as exc:
+        logging.warning("Could not load documentation snapshot %s: %s", snapshot_path, exc)
+        return catalog, "built-in verified subset"
+
+
+def normalize_partitioned_metadata(metadata):
+    """Treat explicit _part_<number> tables as one logical dataset."""
+    normalized = copy.deepcopy(metadata)
+    source_tables = metadata.get("tables", {})
+    exact_names = set(source_tables)
+    aliases = {}
+    normalized_tables = {}
+
+    for table_name, table_info in source_tables.items():
+        match = re.fullmatch(r"(?P<base>.+)_part_\d+", table_name, flags=re.IGNORECASE)
+        logical_name = match.group("base") if match and match.group("base") not in exact_names else table_name
+        aliases[table_name] = logical_name
+        if logical_name not in normalized_tables:
+            normalized_tables[logical_name] = copy.deepcopy(table_info)
+            if logical_name != table_name:
+                normalized_tables[logical_name]["file_pattern"] = f"{logical_name}_part_*.parquet"
+                normalized_tables[logical_name]["total_rows"] = 0
+                normalized_tables[logical_name]["source_file_count"] = 0
+        if logical_name != table_name:
+            rows = table_info.get("total_rows", 0)
+            if isinstance(rows, (int, float)):
+                normalized_tables[logical_name]["total_rows"] += rows
+            normalized_tables[logical_name]["source_file_count"] += table_info.get("source_file_count", 1)
+
+    normalized_columns = []
+    seen_columns = set()
+    for column in metadata.get("columns", []):
+        column_copy = copy.deepcopy(column)
+        old_table = column_copy.get("table", "data")
+        logical_name = aliases.get(old_table, old_table)
+        column_copy["table"] = logical_name
+        column_copy["description"] = re.sub(
+            r"^Table:.*$",
+            f"Table: {logical_name}",
+            column_copy.get("description", ""),
+            count=1,
+            flags=re.MULTILINE,
+        )
+        key = (logical_name, column_copy.get("name"), column_copy.get("type"))
+        if key not in seen_columns:
+            seen_columns.add(key)
+            normalized_columns.append(column_copy)
+
+    normalized_relationships = []
+    seen_relationships = set()
+    for relationship in metadata.get("relationships", []):
+        item = copy.deepcopy(relationship)
+        item["from_table"] = aliases.get(item.get("from_table"), item.get("from_table"))
+        item["to_table"] = aliases.get(item.get("to_table"), item.get("to_table"))
+        if item["from_table"] == item["to_table"]:
+            continue
+        forward = (
+            item.get("from_table"), item.get("from_column"),
+            item.get("to_table"), item.get("to_column"),
+        )
+        reverse = (forward[2], forward[3], forward[0], forward[1])
+        canonical = sorted((forward, reverse), key=lambda row: tuple(str(value) for value in row))[0]
+        if canonical not in seen_relationships:
+            seen_relationships.add(canonical)
+            normalized_relationships.append(item)
+
+    normalized["tables"] = normalized_tables
+    normalized["columns"] = normalized_columns
+    normalized["relationships"] = normalized_relationships
+    return normalized
+
+
+def enrich_metadata_with_documentation(metadata):
+    """Attach public documentation when table names and observed columns support a match."""
+    enriched = copy.deepcopy(metadata)
+    catalog, source_label = load_documentation_catalog()
+    columns_by_table = {}
+    for column in enriched.get("columns", []):
+        columns_by_table.setdefault(column.get("table", "data"), set()).add(column.get("name", ""))
+
+    matched_tables = []
+    for table_name, table_info in enriched.get("tables", {}).items():
+        candidate = catalog.get(normalize_documentation_name(table_name))
+        if not candidate:
+            continue
+        observed = columns_by_table.get(table_name, set())
+        documented = set(candidate.get("columns", {}))
+        overlap = observed & documented
+        if observed and documented and not overlap:
+            continue
+        table_info["official_documentation"] = {
+            "dataset_name": candidate.get("dataset_name", ""),
+            "description": candidate.get("dataset_description", ""),
+            "url": candidate.get("url", ""),
+            "matched_column_count": len(overlap),
+        }
+        matched_tables.append(table_name)
+        lookup = {name.lower(): details for name, details in candidate.get("columns", {}).items()}
+        for column in enriched.get("columns", []):
+            if column.get("table") != table_name:
+                continue
+            details = lookup.get(str(column.get("name", "")).lower())
+            if details:
+                column["official_documentation"] = {
+                    key: value for key, value in details.items() if value
+                }
+
+    enriched["documentation_enrichment"] = {
+        "source": source_label,
+        "matched_tables": matched_tables,
+        "matched_table_count": len(matched_tables),
+        "total_table_count": len(enriched.get("tables", {})),
+    }
+    return enriched
+
+
+def strip_documentation_enrichment(metadata):
+    """Remove prior documentation fields before applying a different snapshot."""
+    clean = copy.deepcopy(metadata)
+    clean.pop("documentation_enrichment", None)
+    for table_info in clean.get("tables", {}).values():
+        table_info.pop("official_documentation", None)
+    for column in clean.get("columns", []):
+        column.pop("official_documentation", None)
+    return clean
+
+
+def refresh_current_documentation():
+    """Reapply documentation to an already-processed dataset and its artifact metadata."""
+    if not st.session_state.get("dataset_ready") or not st.session_state.get("metadata"):
+        return
+    metadata = strip_documentation_enrichment(st.session_state.metadata)
+    metadata = enrich_metadata_with_documentation(metadata)
+    st.session_state.metadata = metadata
+    st.session_state.starter_questions = []
+    metadata_path = os.path.join(st.session_state.artifacts_dir, "metadata.json")
+    if st.session_state.artifacts_dir and os.path.isdir(st.session_state.artifacts_dir):
+        with open(metadata_path, "w", encoding="utf-8") as handle:
+            json.dump(metadata, handle, indent=2)
+
+
+def build_documentation_context(metadata):
+    lines = []
+    columns_by_table = {}
+    for column in metadata.get("columns", []):
+        columns_by_table.setdefault(column.get("table", "data"), []).append(column)
+    for table_name, table_info in metadata.get("tables", {}).items():
+        official = table_info.get("official_documentation")
+        if not official:
+            continue
+        lines.append(
+            f"- Logical table `{table_name}` matches official Brightspace dataset "
+            f"`{official.get('dataset_name', table_name)}`: {official.get('description', '')}"
+        )
+        if official.get("url"):
+            lines.append(f"  Official documentation: {official['url']}")
+        for column in columns_by_table.get(table_name, []):
+            details = column.get("official_documentation", {})
+            if not details:
+                continue
+            text = details.get("description", "")
+            if details.get("values"):
+                text += f" Documented values: {details['values']}."
+            if details.get("key"):
+                text += f" Key: {details['key']}."
+            lines.append(f"  - `{column.get('name')}`: {text.strip()}")
+    if not lines:
+        return ""
+    return (
+        "\nOFFICIAL BRIGHTSPACE DOCUMENTATION CONTEXT "
+        "(actual processed columns and types remain authoritative):\n"
+        + "\n".join(lines)
+        + "\n"
+    )
 
 
 def split_parquet_to_chunks(source_parquet, table_name, rows_per_chunk, output_dir, status):
@@ -791,6 +1117,7 @@ def write_local_execution_zip():
     repo_root = os.path.dirname(app_path)
     requirements_path = os.path.join(repo_root, "requirements.txt")
     config_path = os.path.join(repo_root, ".streamlit", "config.toml")
+    documentation_path = get_documentation_snapshot_path()
 
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -800,6 +1127,11 @@ def write_local_execution_zip():
             zf.write(requirements_path, "requirements.txt")
         if os.path.exists(config_path):
             zf.write(config_path, ".streamlit/config.toml")
+        uploaded_documentation = st.session_state.get("documentation_snapshot_bytes", b"")
+        if uploaded_documentation:
+            zf.writestr(DOCUMENTATION_METADATA_FILENAME, uploaded_documentation)
+        elif documentation_path:
+            zf.write(documentation_path, DOCUMENTATION_METADATA_FILENAME)
         zf.writestr("README_LOCAL.md", build_local_run_readme())
         zf.writestr(".streamlit/secrets.toml.example", build_local_secrets_example())
         zf.writestr("run_local_app.bat", build_windows_launcher())
@@ -876,6 +1208,8 @@ def process_uploaded_files(uploaded_files, strategy):
             "columns": result["columns"],
             "relationships": result["relationships"],
         }
+        metadata = normalize_partitioned_metadata(metadata)
+        metadata = enrich_metadata_with_documentation(metadata)
         metadata["table_overlaps"] = analyze_table_overlaps(metadata)
 
         metadata_path = os.path.join(artifacts_dir, "metadata.json")
@@ -986,6 +1320,7 @@ def build_relationship_context(metadata):
 
 def build_context_block(metadata, question):
     columns = metadata.get("columns", [])
+    documentation_context = build_documentation_context(metadata)
     if len(columns) <= FULL_SCHEMA_THRESHOLD:
         selected = columns
     else:
@@ -1007,10 +1342,17 @@ def build_context_block(metadata, question):
 
     lines = ["RELEVANT SCHEMA:"]
     for item in selected:
+        documented = item.get("official_documentation", {})
+        official_note = ""
+        if documented.get("description"):
+            official_note = f" | Official meaning `{documented['description']}`"
+        if documented.get("values"):
+            official_note += f" | Documented values `{documented['values']}`"
         lines.append(
-            f"- Table `{item['table']}` | Column `{item['name']}` | Type `{item['type']}` | Samples `{item['description'].split('Samples: ', 1)[-1]}`"
+            f"- Table `{item['table']}` | Column `{item['name']}` | Type `{item['type']}` "
+            f"| Samples `{item['description'].split('Samples: ', 1)[-1]}`{official_note}"
         )
-    return "\n".join(lines)
+    return "\n".join(lines) + documentation_context
 
 
 def _strip_markdown_sql(text):
@@ -1082,12 +1424,16 @@ def build_table_overview_rows(metadata):
         table_columns.setdefault(column["table"], []).append(column["name"])
 
     for table_name, table_info in metadata.get("tables", {}).items():
+        official = table_info.get("official_documentation", {})
         rows.append(
             {
                 "table_name": table_name,
                 "row_count": table_info.get("total_rows"),
                 "column_count": len(table_columns.get(table_name, [])),
-                "appears_to_represent": infer_table_description(table_name, table_columns.get(table_name, [])),
+                "appears_to_represent": official.get("description")
+                or infer_table_description(table_name, table_columns.get(table_name, [])),
+                "official_dataset": official.get("dataset_name", ""),
+                "official_documentation": official.get("url", ""),
             }
         )
     return pd.DataFrame(rows)
@@ -1118,10 +1464,14 @@ def build_columns_dataframe(metadata, table_name):
         if column["table"] != table_name:
             continue
         samples = column["description"].split("Samples: ", 1)[-1]
+        documented = column.get("official_documentation", {})
         rows.append(
             {
                 "column_name": column["name"],
                 "data_type": column["type"],
+                "official_meaning": documented.get("description", ""),
+                "documented_values": documented.get("values", ""),
+                "documented_key": documented.get("key", ""),
                 "sample_values": samples,
             }
         )
@@ -1288,6 +1638,9 @@ SQL RULES:
 14. When grouping activity by role or category, count the activity/event ID from the activity table, not the user ID unless the user asked for distinct users.
 15. If a join can multiply rows, use a subquery or COUNT(DISTINCT ...) when needed.
 16. If the user explicitly names tables, use all of those tables unless one is clearly irrelevant to the requested output.
+17. A wildcard may cover multiple physical Parquet chunks or numbered source parts for one logical table. Read the wildcard once; never join its individual files.
+18. Use documented field meanings and documented values when supplied. Never invent category, status, state, or source values. If values are undocumented, query distinct values before filtering.
+19. Return descriptive results. Do not infer causes, educational outcomes, or user intent from activity logs.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1426,6 +1779,8 @@ Rules:
 2. Call out concrete counts, rates, and patterns.
 3. If relevant, suggest a sensible next question.
 4. Do not speculate about redacted values.
+5. Describe only what the result establishes. Do not invent causes, educational implications, or user intent.
+6. Use "records" rather than "sessions", "users", or other entities unless the SQL grain establishes that meaning.
 """
     response = client.chat.completions.create(
         model=model_name,
@@ -1492,13 +1847,20 @@ def generate_starter_questions(metadata, client, model_name):
     for item in columns[:40]:
         lines.append(f"- {item['table']}.{item['name']} ({item['type']})")
 
+    documentation_context = build_documentation_context(metadata)
+
     prompt = f"""Generate 5 short starter questions for a non-technical user exploring an education dataset.
-Use only the schema below.
+Use only the observed schema and official documentation below.
 
 SCHEMA:
 {chr(10).join(lines)}
+{documentation_context}
 
-Output one question per line and nothing else.
+RULES:
+- Use documented field meanings and documented values; do not invent status labels or categories.
+- Do not suggest row-level questions about IP addresses or other sensitive identifiers.
+- Prefer descriptive operational questions over causal claims the data cannot establish.
+- Output one question per line and nothing else.
 """
     try:
         response = client.chat.completions.create(
@@ -1543,6 +1905,39 @@ def render_sidebar():
             api_key = st.text_input(f"{provider_name} API key", type="password")
 
         model_name = st.text_input("Model name", value=provider_config["default_model"])
+
+        st.markdown("---")
+        st.subheader("Dataset documentation")
+        documentation_upload = st.file_uploader(
+            "Brightspace metadata CSV (optional)",
+            type=["csv"],
+            key="documentation_metadata_upload",
+            help=(
+                "Upload the latest metadata CSV exported by the Dataset Explorer. "
+                "It is held only for this Streamlit session and applied to both new and already-processed datasets."
+            ),
+        )
+        if documentation_upload is not None:
+            uploaded_bytes = documentation_upload.getvalue()
+            uploaded_digest = hashlib.sha256(uploaded_bytes).hexdigest()
+            try:
+                documentation_frame = parse_documentation_snapshot(uploaded_bytes)
+                if uploaded_digest != st.session_state.documentation_snapshot_digest:
+                    st.session_state.documentation_snapshot_bytes = uploaded_bytes
+                    st.session_state.documentation_snapshot_name = documentation_upload.name
+                    st.session_state.documentation_snapshot_digest = uploaded_digest
+                    refresh_current_documentation()
+                st.success(
+                    f"Loaded {documentation_frame['dataset_name'].nunique():,} datasets and "
+                    f"{len(documentation_frame):,} column records."
+                )
+            except Exception as exc:
+                st.error(f"Could not use this documentation file: {exc}")
+        elif st.session_state.documentation_snapshot_digest:
+            st.session_state.documentation_snapshot_bytes = b""
+            st.session_state.documentation_snapshot_name = ""
+            st.session_state.documentation_snapshot_digest = ""
+            refresh_current_documentation()
 
         st.markdown("---")
         st.session_state.pii_redaction = st.toggle(
@@ -1671,6 +2066,32 @@ def render_dataset_summary():
     col3.metric("Columns", len(metadata.get("columns", [])))
     col4.metric("Upload size (MB)", summary.get("uploaded_mb", 0.0))
 
+    docs_info = metadata.get("documentation_enrichment", {})
+    matched_count = docs_info.get("matched_table_count", 0)
+    total_count = docs_info.get("total_table_count", len(metadata.get("tables", {})))
+    if matched_count:
+        st.success(
+            f"Official Brightspace documentation matched {matched_count}/{total_count} logical table(s) "
+            f"using {docs_info.get('source', 'the built-in verified subset')}."
+        )
+        with st.expander("Official dataset documentation", expanded=False):
+            for table_name, table_info in metadata.get("tables", {}).items():
+                official = table_info.get("official_documentation")
+                if not official:
+                    continue
+                st.markdown(f"**`{table_name}` → {official.get('dataset_name', table_name)}**")
+                if official.get("description"):
+                    st.write(official["description"])
+                if official.get("url"):
+                    st.markdown(f"[Open official documentation]({official['url']})")
+        if docs_info.get("source") == "built-in verified subset":
+            st.caption(
+                f"Upload `{DOCUMENTATION_METADATA_FILENAME}` in the sidebar, or add it to the app repository, "
+                "to enable the full Brightspace documentation catalog."
+            )
+    else:
+        st.caption("No official documentation match was found; analysis will use observed schema only.")
+
     with st.expander("Artifact summary", expanded=False):
         st.json(
             {
@@ -1678,6 +2099,7 @@ def render_dataset_summary():
                 "tables": metadata.get("tables", {}),
                 "relationships": metadata.get("relationships", []),
                 "table_overlaps": metadata.get("table_overlaps", []),
+                "documentation_enrichment": docs_info,
             }
         )
 
