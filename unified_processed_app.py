@@ -16,6 +16,9 @@ import time
 import uuid
 import zipfile
 
+# vD6: Suggested-question buttons use a one-time pending submission so they
+# execute through the same chat pipeline as questions entered in the text box.
+
 import duckdb
 import pandas as pd
 import pyarrow as pa
@@ -31,7 +34,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 
-APP_TITLE = "Cloud RAG Data Assistant - vD5"
+APP_TITLE = "Cloud RAG Data Assistant - vD6"
 APP_SUBTITLE = "Unified pre + post process for sanitized or dummy CSV data"
 SESSION_ROOT = os.path.join(tempfile.gettempdir(), "streamlit_cloud_rag")
 CHUNK_SIZE_MB = 64
@@ -209,6 +212,8 @@ def ensure_session_state():
         st.session_state.metadata = None
     if "starter_questions" not in st.session_state:
         st.session_state.starter_questions = []
+    if "pending_question" not in st.session_state:
+        st.session_state.pending_question = ""
     if "pii_redaction" not in st.session_state:
         st.session_state.pii_redaction = True
     if "processing_summary" not in st.session_state:
@@ -237,6 +242,7 @@ def reset_dataset_state():
     st.session_state.artifacts_dir = ""
     st.session_state.metadata = None
     st.session_state.starter_questions = []
+    st.session_state.pending_question = ""
     st.session_state.processing_summary = {}
     st.session_state.messages = [
         {"role": "assistant", "content": "Upload sanitized data, process it, and then ask a question."}
@@ -1221,6 +1227,7 @@ def process_uploaded_files(uploaded_files, strategy):
         st.session_state.artifacts_dir = artifacts_dir
         st.session_state.metadata = metadata
         st.session_state.starter_questions = []
+        st.session_state.pending_question = ""
         st.session_state.messages = [
             {"role": "assistant", "content": "Dataset processed. Ask a question about the uploaded data."}
         ]
@@ -2128,7 +2135,7 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
     table_inventory = build_table_inventory(metadata, artifacts_dir)
     relationship_context = build_relationship_context(metadata)
 
-    if not st.session_state.starter_questions:
+    if not st.session_state.starter_questions and not st.session_state.pending_question:
         with st.spinner("Generating starter questions..."):
             st.session_state.starter_questions = generate_starter_questions(metadata, client, model_name)
 
@@ -2137,16 +2144,16 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
 
     if st.session_state.starter_questions and len(st.session_state.messages) <= 2:
         st.caption("Suggested questions")
-        selected_question = None
         for question in st.session_state.starter_questions:
             if st.button(question, key=f"starter_{question}", use_container_width=True):
-                selected_question = question
-        if selected_question:
-            st.session_state.messages.append({"role": "user", "content": selected_question})
-            st.session_state.starter_questions = []
-            st.rerun()
+                if not st.session_state.pending_question:
+                    st.session_state.pending_question = question
+                    st.session_state.starter_questions = []
+                    st.rerun()
 
-    user_input = st.chat_input("Ask about the processed dataset")
+    typed_input = st.chat_input("Ask about the processed dataset")
+    pending_input = st.session_state.pop("pending_question", "")
+    user_input = pending_input or typed_input
     if not user_input:
         return
 
