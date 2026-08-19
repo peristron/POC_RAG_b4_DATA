@@ -16,8 +16,8 @@ import time
 import uuid
 import zipfile
 
-# vD6: Suggested-question buttons use a one-time pending submission so they
-# execute through the same chat pipeline as questions entered in the text box.
+# vD6: suggested-question buttons use a one-time pending submission so they
+# execute through the same chat pipeline as questions entered in the text box
 
 import duckdb
 import pandas as pd
@@ -100,16 +100,61 @@ PROVIDER_CONFIG = {
         "base_url": "https://api.deepseek.com",
         "default_model": "deepseek-chat",
         "secret_key": "DEEPSEEK_API_KEY",
+        "model_secret_key": "DEEPSEEK_MODEL",
     },
     "OpenAI": {
         "base_url": "https://api.openai.com/v1",
         "default_model": "gpt-4o-mini",
         "secret_key": "OPENAI_API_KEY",
+        "model_secret_key": "OPENAI_MODEL",
     },
     "xAI (Grok)": {
         "base_url": "https://api.x.ai/v1",
         "default_model": "grok-2-latest",
         "secret_key": "XAI_API_KEY",
+        "model_secret_key": "XAI_MODEL",
+    },
+    "Kimi": {
+        "base_url": "https://api.moonshot.ai/v1",
+        "default_model": "kimi-k2.6",
+        "secret_key": "KIMI_API_KEY",
+        "model_secret_key": "KIMI_MODEL",
+    },
+    "Qwen (Alibaba Cloud)": {
+        "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        "default_model": "qwen-plus",
+        "secret_key": "QWEN_API_KEY",
+        "model_secret_key": "QWEN_MODEL",
+    },
+    "Z.ai (GLM)": {
+        "base_url": "https://api.z.ai/api/paas/v4",
+        "default_model": "glm-4.7-flash",
+        "secret_key": "GLM_API_KEY",
+        "model_secret_key": "GLM_MODEL",
+    },
+    "MiniMax": {
+        "base_url": "https://api.minimax.io/v1",
+        "default_model": "MiniMax-M2.7",
+        "secret_key": "MINIMAX_API_KEY",
+        "model_secret_key": "MINIMAX_MODEL",
+    },
+    "Mistral": {
+        "base_url": "https://api.mistral.ai/v1",
+        "default_model": "mistral-small-latest",
+        "secret_key": "MISTRAL_API_KEY",
+        "model_secret_key": "MISTRAL_MODEL",
+    },
+    "Cohere": {
+        "base_url": "https://api.cohere.ai/compatibility/v1",
+        "default_model": "command-a-plus-05-2026",
+        "secret_key": "COHERE_API_KEY",
+        "model_secret_key": "COHERE_MODEL",
+    },
+    "SEA-LION": {
+        "base_url": "https://api.sea-lion.ai/v1",
+        "default_model": "aisingapore/Gemma-SEA-LION-v4-27B-IT",
+        "secret_key": "SEALION_API_KEY",
+        "model_secret_key": "SEALION_MODEL",
     },
 }
 
@@ -1068,8 +1113,25 @@ Create `.streamlit/secrets.toml` with one or more of the following keys:
 
 ```toml
 DEEPSEEK_API_KEY = "your-key-here"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 OPENAI_API_KEY = "your-key-here"
+OPENAI_MODEL = "gpt-4o-mini"
 XAI_API_KEY = "your-key-here"
+XAI_MODEL = "grok-2-latest"
+KIMI_API_KEY = "your-key-here"
+KIMI_MODEL = "kimi-k2.6"
+QWEN_API_KEY = "your-key-here"
+QWEN_MODEL = "qwen-plus"
+GLM_API_KEY = "your-key-here"
+GLM_MODEL = "glm-4.7-flash"
+MINIMAX_API_KEY = "your-key-here"
+MINIMAX_MODEL = "MiniMax-M2.7"
+MISTRAL_API_KEY = "your-key-here"
+MISTRAL_MODEL = "mistral-small-latest"
+COHERE_API_KEY = "your-key-here"
+COHERE_MODEL = "command-a-plus-05-2026"
+SEALION_API_KEY = "your-key-here"
+SEALION_MODEL = "aisingapore/Gemma-SEA-LION-v4-27B-IT"
 ```
 
 ## Recommended usage
@@ -1083,8 +1145,25 @@ XAI_API_KEY = "your-key-here"
 
 def build_local_secrets_example():
     return """DEEPSEEK_API_KEY = "your-key-here"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 OPENAI_API_KEY = "your-key-here"
+OPENAI_MODEL = "gpt-4o-mini"
 XAI_API_KEY = "your-key-here"
+XAI_MODEL = "grok-2-latest"
+KIMI_API_KEY = "your-key-here"
+KIMI_MODEL = "kimi-k2.6"
+QWEN_API_KEY = "your-key-here"
+QWEN_MODEL = "qwen-plus"
+GLM_API_KEY = "your-key-here"
+GLM_MODEL = "glm-4.7-flash"
+MINIMAX_API_KEY = "your-key-here"
+MINIMAX_MODEL = "MiniMax-M2.7"
+MISTRAL_API_KEY = "your-key-here"
+MISTRAL_MODEL = "mistral-small-latest"
+COHERE_API_KEY = "your-key-here"
+COHERE_MODEL = "command-a-plus-05-2026"
+SEALION_API_KEY = "your-key-here"
+SEALION_MODEL = "aisingapore/Gemma-SEA-LION-v4-27B-IT"
 """
 
 
@@ -1911,7 +1990,21 @@ def render_sidebar():
         else:
             api_key = st.text_input(f"{provider_name} API key", type="password")
 
-        model_name = st.text_input("Model name", value=provider_config["default_model"])
+        model_name = provider_config["default_model"]
+        try:
+            configured_model = str(
+                st.secrets.get(provider_config["model_secret_key"], "")
+            ).strip()
+            if configured_model:
+                model_name = configured_model
+        except Exception:
+            pass
+
+        model_name = st.text_input(
+            "Model name",
+            value=model_name,
+            key=f"model_name_{provider_name}",
+        )
 
         st.markdown("---")
         st.subheader("Dataset documentation")
