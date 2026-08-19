@@ -1877,43 +1877,121 @@ Rules:
 
 def attempt_visualization(df):
     try:
-        if df.empty:
+        if df.empty or len(df) < 2:
             return
 
-        if len(df) < 2:
-            return
+        chart_data = df.copy()
+        numeric_cols = chart_data.select_dtypes(include=["number"]).columns.tolist()
+        date_cols = chart_data.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
+        categorical_cols = chart_data.select_dtypes(
+            include=["object", "string", "category"]
+        ).columns.tolist()
 
-        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-        date_cols = df.select_dtypes(include=["datetime", "datetimetz"]).columns.tolist()
-        categorical_cols = df.select_dtypes(include=["object", "string", "category"]).columns.tolist()
+        def normalized_column_name(column_name):
+            return re.sub(r"[^a-z0-9]", "", str(column_name).lower())
+
+        def is_identifier_column(column_name):
+            name = normalized_column_name(column_name)
+            return (
+                name in {"id", "version", "rownum", "rownumber", "rn"}
+                or name.endswith("id")
+                or name.endswith("identifier")
+                or name.endswith("key")
+            )
+
+        numeric_metrics = [
+            column
+            for column in numeric_cols
+            if not is_identifier_column(column)
+            and chart_data[column].nunique(dropna=True) > 1
+        ]
 
         if not date_cols:
-            for col_name in list(categorical_cols):
-                converted = pd.to_datetime(df[col_name], errors="coerce", format="mixed", utc=True)
+            for column in list(categorical_cols):
+                name = normalized_column_name(column)
+                if not any(token in name for token in ("date", "time", "timestamp")):
+                    continue
+                converted = pd.to_datetime(
+                    chart_data[column], errors="coerce", format="mixed", utc=True
+                )
                 if converted.notna().mean() > 0.8:
-                    df = df.copy()
-                    df[col_name] = converted
-                    date_cols.append(col_name)
-                    categorical_cols.remove(col_name)
+                    chart_data[column] = converted
+                    date_cols.append(column)
+                    categorical_cols.remove(column)
                     break
 
-        if len(df.columns) <= 2 and len(df) <= 5 and len(numeric_cols) >= 1:
+        pii_columns = set(detect_pii_columns(chart_data))
+        categorical_candidates = [
+            column
+            for column in categorical_cols
+            if column not in pii_columns
+            and chart_data[column].nunique(dropna=True) > 1
+        ]
+
+        category_priority = (
+            "label",
+            "code",
+            "category",
+            "source",
+            "status",
+            "state",
+            "type",
+            "device",
+        )
+
+        def category_rank(column_name):
+            name = normalized_column_name(column_name)
+            for rank, token in enumerate(category_priority):
+                if token in name:
+                    return rank
+            return len(category_priority)
+
+        categorical_candidates.sort(
+            key=lambda column: (
+                category_rank(column),
+                categorical_cols.index(column),
+            )
+        )
+
+        if len(chart_data.columns) <= 2 and len(chart_data) <= 5 and numeric_metrics:
             return
 
-        st.caption("Auto-visualization")
-        if date_cols and numeric_cols:
-            st.line_chart(df.set_index(date_cols[0])[numeric_cols[:3]].sort_index())
+        if date_cols and numeric_metrics:
+            metrics = numeric_metrics[:3]
+            line_data = (
+                chart_data[[date_cols[0], *metrics]]
+                .dropna(subset=[date_cols[0]])
+                .sort_values(date_cols[0])
+                .set_index(date_cols[0])
+            )
+            if not line_data.empty:
+                st.caption(f"Auto-visualization: {', '.join(metrics)} by {date_cols[0]}")
+                st.line_chart(line_data)
             return
-        if categorical_cols and numeric_cols:
-            chart_df = df.head(25).set_index(categorical_cols[0])[numeric_cols[0]]
-            st.bar_chart(chart_df)
+
+        if categorical_candidates and numeric_metrics:
+            category = categorical_candidates[0]
+            metric = numeric_metrics[0]
+            bar_data = chart_data[[category, metric]].dropna().copy()
+            bar_data = bar_data[bar_data[category].astype(str).str.strip().ne("")]
+            bar_data = bar_data.sort_values(metric, ascending=False).head(25)
+            if not bar_data.empty:
+                st.caption(
+                    f"Auto-visualization: {metric} by {category} (top {len(bar_data)})"
+                )
+                st.bar_chart(bar_data.set_index(category)[[metric]])
             return
-        if len(numeric_cols) >= 2:
-            st.scatter_chart(df, x=numeric_cols[0], y=numeric_cols[1])
+
+        if len(numeric_metrics) >= 2:
+            st.caption(f"Auto-visualization: {numeric_metrics[1]} by {numeric_metrics[0]}")
+            st.scatter_chart(chart_data, x=numeric_metrics[0], y=numeric_metrics[1])
             return
-        if len(numeric_cols) == 1:
-            series = df[numeric_cols[0]].dropna()
-            if 0 < series.nunique() <= 50:
+
+        if len(numeric_metrics) == 1:
+            metric = numeric_metrics[0]
+            series = chart_data[metric].dropna()
+            if 1 < series.nunique() <= 50:
+                st.caption(f"Auto-visualization: distribution of {metric}")
                 st.bar_chart(series.value_counts().sort_index())
     except Exception as exc:
         logging.info("Visualization skipped: %s", exc)
@@ -2253,10 +2331,15 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
     st.session_state.messages.append({"role": "user", "content": user_input})
     st.chat_message("user").write(user_input)
     st.session_state.starter_questions = []
+    request_started = time.perf_counter()
 
     with st.chat_message("assistant"):
         with st.status("Thinking...", expanded=False) as status:
             try:
+                sql_generation_seconds = 0.0
+                query_execution_seconds = 0.0
+                summary_seconds = 0.0
+
                 direct_response = handle_metadata_question(user_input, metadata)
                 if direct_response is not None:
                     status.write(direct_response["title"])
@@ -2269,7 +2352,11 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                             file_name="metadata_results.csv",
                             mime="text/csv",
                         )
-                    status.update(label="✅ Answer ready", state="complete")
+                    total_seconds = time.perf_counter() - request_started
+                    status.update(
+                        label=f"✅ Answer ready in {total_seconds:.1f}s",
+                        state="complete",
+                    )
                     st.write(direct_response["answer"])
                     st.session_state.messages.append({"role": "assistant", "content": direct_response["answer"]})
                     return
@@ -2292,6 +2379,7 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                     )
 
                 status.write(f"Generating SQL with {provider_name} ({model_name})")
+                phase_started = time.perf_counter()
                 sql = get_sql_query(
                     user_input,
                     table_inventory,
@@ -2302,17 +2390,22 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                     relationship_context,
                     explicit_table_block,
                 )
+                sql_generation_seconds += time.perf_counter() - phase_started
+                status.write(f"SQL generated in {sql_generation_seconds:.1f}s")
                 display_sql = sanitize_sql_for_display(sql, metadata, artifacts_dir)
                 st.code(display_sql, language="sql")
 
                 clean_sql = validate_sql(sql, artifacts_dir)
                 status.write("Executing query")
 
+                phase_started = time.perf_counter()
                 try:
                     df = execute_validated_sql(clean_sql, artifacts_dir)
                 except Exception as first_error:
+                    query_execution_seconds += time.perf_counter() - phase_started
                     logging.info("First SQL attempt failed: %s", first_error)
                     status.write("Retrying with SQL repair")
+                    phase_started = time.perf_counter()
                     sql_retry = fix_sql_query(
                         user_input,
                         sql,
@@ -2324,10 +2417,19 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                         relationship_context,
                         explicit_table_block,
                     )
+                    repair_seconds = time.perf_counter() - phase_started
+                    sql_generation_seconds += repair_seconds
+                    status.write(f"SQL repair generated in {repair_seconds:.1f}s")
                     retry_display_sql = sanitize_sql_for_display(sql_retry, metadata, artifacts_dir)
                     st.code(retry_display_sql, language="sql")
                     clean_sql = validate_sql(sql_retry, artifacts_dir)
+                    phase_started = time.perf_counter()
                     df = execute_validated_sql(clean_sql, artifacts_dir)
+                    query_execution_seconds += time.perf_counter() - phase_started
+                else:
+                    query_execution_seconds += time.perf_counter() - phase_started
+
+                status.write(f"Query executed in {query_execution_seconds:.1f}s")
 
                 if len(df) >= HARD_ROW_LIMIT:
                     st.warning(
@@ -2346,6 +2448,7 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
 
                 if not df.empty:
                     status.write("Summarizing results")
+                    phase_started = time.perf_counter()
                     answer = summarize_answer(
                         user_input,
                         df,
@@ -2353,18 +2456,31 @@ def render_chat_ui(provider_name, api_key, model_name, provider_config):
                         model_name,
                         st.session_state.pii_redaction,
                     )
+                    summary_seconds = time.perf_counter() - phase_started
+                    status.write(f"Summary generated in {summary_seconds:.1f}s")
                 else:
                     answer = "The query returned no rows. Try broadening the question or asking for a different slice of the data."
 
-                status.update(label="✅ Answer ready", state="complete")
+                total_seconds = time.perf_counter() - request_started
+                status.write(
+                    f"Timing: SQL {sql_generation_seconds:.1f}s · "
+                    f"query {query_execution_seconds:.1f}s · "
+                    f"summary {summary_seconds:.1f}s"
+                )
+                status.update(
+                    label=f"✅ Answer ready in {total_seconds:.1f}s",
+                    state="complete",
+                )
                 st.write(answer)
                 st.session_state.messages.append({"role": "assistant", "content": answer})
             except ValueError as exc:
-                status.update(label="🔒 Blocked", state="error")
+                total_seconds = time.perf_counter() - request_started
+                status.update(label=f"🔒 Blocked after {total_seconds:.1f}s", state="error")
                 st.error(str(exc))
             except Exception as exc:
                 logging.exception("Unhandled chat error")
-                status.update(label="❌ Failed", state="error")
+                total_seconds = time.perf_counter() - request_started
+                status.update(label=f"❌ Failed after {total_seconds:.1f}s", state="error")
                 st.error(str(exc))
 
 
